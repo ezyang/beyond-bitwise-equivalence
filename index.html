@@ -1,0 +1,1112 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script>document.documentElement.classList.toggle('dark', (localStorage.getItem('bbe-theme') ?? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')) === 'dark');</script>
+  <title>Beyond bitwise equivalence</title>
+  <meta name="description" content="Why two implementations of the same computation produce different bits, from reduction order and fused multiply-add up to attention kernels, and how to write down exactly which function a kernel computes.">
+  <link rel="stylesheet" href="./site.css">
+</head>
+
+<body>
+  <main>
+    <h1>Beyond bitwise equivalence</h1>
+    <p class="dek">Why two implementations of the same computation produce
+    different bits, and how to write down exactly which function a kernel
+    computes.</p>
+
+    <p class="draft"><b>Draft.</b> All prose on this page is an AI-drafted
+    first pass and has not been edited yet. The illustrations are also
+    AI-built.</p>
+
+    <p>Run compiled flex attention, PyTorch's SDPA math backend and a
+    straightforward fp32 reference on the same bf16 inputs on the same GPU,
+    and you get three different answers. A hand-written kernel such as
+    FlashAttention 4 gives a fourth. They disagree with one another in a
+    large fraction of the output elements, mostly by one bf16 ulp. None of
+    them is wrong.
+    They are different functions that all deserve the name "attention."</p>
+
+    <p>Most of the time we deal with this by comparing against a reference
+    with a tolerance and moving on. That works until it doesn't. A training
+    run diverges after a kernel swap and you want to know whether the new
+    kernel is buggy or just rounds differently. A test with <code>atol=1e-2</code> passes,
+    and you want to know what bugs fit inside that tolerance. All of these
+    questions are easier to answer if you can say, precisely, which function
+    each implementation computes.</p>
+
+    <p>This tutorial is about doing that. The first part covers the generic
+    reasons two programs that compute "the same thing" disagree: rounding,
+    reduction order, fused multiply-add, fast math, and where constants get
+    rounded. These are well known, and if you only remember one thing from
+    this page it should be that they are usually the whole story. The second
+    part looks at the tensor core, whose arithmetic is not IEEE fp32 at all.
+    The third and fourth parts apply all of this to attention, forward and
+    backward, where the remaining differences come from the algorithm's
+    structure, the compiler, and the wrapper code that picks a kernel
+    configuration. The running example is a set of eager PyTorch programs
+    ("specs") that reproduce compiled flex attention and two fp32
+    references bit for bit on a GB300, across a sweep of shapes, written so
+    that the well-known optimizations of hand-written kernels (lazy
+    rescaling, fused exponents, approximate reciprocals) are each one
+    parameter away.</p>
+
+    <ol class="toc">
+      <li><a href="#rounding">Every operation rounds</a></li>
+      <li><a href="#reduction">Reduction order</a></li>
+      <li><a href="#fma">Fused multiply-add</a></li>
+      <li><a href="#fastmath">Fast math</a></li>
+      <li><a href="#constants">Constants and casts</a></li>
+      <li><a href="#tensorcore">The tensor core is not an fp32 matmul</a></li>
+      <li><a href="#online">Online softmax</a></li>
+      <li><a href="#variants">Two kernels, one loop</a></li>
+      <li><a href="#compiler">The compiler is part of the semantics</a></li>
+      <li><a href="#shape">The wrapper and the shape are part of the semantics</a></li>
+      <li><a href="#fp32ref">The fp32 reference is a function too</a></li>
+      <li><a href="#backward">The backward</a></li>
+      <li><a href="#language">What a spec language needs</a></li>
+      <li><a href="#beyond">Beyond bitwise equivalence</a></li>
+    </ol>
+
+    <!-- ================================================================ -->
+    <h2 id="rounding">1. Every operation rounds</h2>
+
+    <p>A floating-point format can only represent a finite set of numbers.
+    fp32 has 24 significant bits; bf16 has 8. When you add, subtract,
+    multiply or divide two floating-point numbers, IEEE 754 requires the
+    hardware to compute the exact real result and then round it to the
+    nearest representable number (ties go to the one whose last bit is
+    even). This is a strong guarantee. A single <code>a + b</code> in fp32
+    gives the same bits on every conforming machine.</p>
+
+    <p>The trouble starts with the second operation. Because every
+    intermediate result is rounded, the result of an expression depends on
+    the order in which the operations happen. Addition is commutative, but it
+    is not associative: <code>(a + b) + c</code> and <code>a + (b + c)</code>
+    round at different points and can give different answers.</p>
+
+    <figure>
+      <bbe-rounding data-widget></bbe-rounding>
+      <figcaption>Three bf16 numbers, two evaluation orders.</figcaption>
+    </figure>
+
+    <p>Here <code>a = 1</code> and <code>b = c = 2<sup>&minus;8</sup></code>.
+    Just above 1, bf16 values are 2<sup>&minus;7</sup> apart, so
+    <code>1 + b</code> falls exactly halfway between two of them. Ties round
+    to the neighbour with an even last bit, which is 1, so <code>b</code>
+    disappears, and then <code>c</code> disappears the same way. Adding
+    <code>b + c</code> first gives 2<sup>&minus;7</sup> exactly, which is
+    big enough to survive being added to 1. The same thing happens in fp32
+    at a larger scale: near 10<sup>8</sup>, fp32 values are 8 apart, so
+    adding 4 twice to 10<sup>8</sup> leaves it unchanged, while adding 8
+    once does not.</p>
+
+    <p>So the function a floating-point program computes is determined by
+    its exact sequence of rounded operations, not by the mathematical
+    expression it was derived from. Two programs are bitwise equivalent when
+    they perform the same rounded operations on the same values, or when
+    they happen to agree anyway. Everything in the rest of this tutorial is
+    a specific way two programs end up performing different sequences.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="reduction">2. Reduction order</h2>
+
+    <p>The most common source of difference is the order of a sum. A
+    reduction over <i>n</i> elements has many valid orders, and each gives
+    its own result. Sequential, left to right, is the order you would write
+    in a loop. A pairwise tree is more accurate and is what you get from a
+    parallel reduction. A GPU kernel usually does something in between: each
+    thread sums its share of the elements sequentially, and then the threads
+    combine their partial sums with a fixed small tree, first across the
+    lanes of a warp and then across warps.</p>
+
+    <figure>
+      <bbe-reduce data-widget></bbe-reduce>
+      <figcaption>The same sixteen fp32 numbers summed in five orders. Each
+      internal node is one rounded fp32 addition. The five orders give five
+      different fp32 results, spread over five ulps; here only the pairwise
+      tree happens to give the correctly rounded sum. "8 interleaved lanes, then
+      a tree" is the kind of order a hand-written kernel uses to sum a row of
+      attention probabilities; "2 spans, then add" is the shape of the order
+      flex attention's Triton code compiles to.</figcaption>
+    </figure>
+
+    <p>The five orders are: left to right, with one accumulator; a pairwise
+    tree, adding neighbours first and then pairs of pairs; eight
+    interleaved lanes, where element <i>i</i> goes to lane <i>i</i> mod 8,
+    each lane sums in order, and the lanes are combined as
+    <code>((0+2)+(4+6)) + ((1+3)+(5+7))</code>; two contiguous spans, one
+    accumulator for elements 0&ndash;7 and one for 8&ndash;15, added at the
+    end; and right to left. The values were chosen with mixed magnitudes so
+    that most additions round.</p>
+
+    <p>Which order a kernel uses depends on things that have nothing to do
+    with the math. To see why, we need a short tour of how a GPU is
+    organized.</p>
+
+    <h3>How a GPU is organized</h3>
+
+    <p>A GPU is a collection of streaming multiprocessors (SMs); an H100 has
+    132 of them. A kernel launch creates a grid of thread blocks, which
+    CUDA also calls cooperative thread arrays (CTAs). Each CTA is assigned
+    to one SM and stays there until it finishes; an SM can host several
+    CTAs at once. The threads of a CTA are grouped into warps of 32. The
+    warp is the unit the hardware actually executes: each cycle, a warp
+    scheduler picks a warp and issues one instruction, and all 32 lanes of
+    the warp execute it together, each on its own registers. This is what
+    NVIDIA calls SIMT.</p>
+
+    <p>Each level of this hierarchy comes with its own way for threads to
+    communicate, and each costs more than the last:</p>
+
+    <ul>
+      <li>Lanes of the same warp can read each other's registers directly,
+      with shuffle instructions.</li>
+      <li>Warps of the same CTA share the SM's shared memory and can wait
+      for each other at a barrier.</li>
+      <li>CTAs on different SMs share nothing but global memory (HBM, behind
+      the L2 cache). They have no cheap way to wait for each other.</li>
+    </ul>
+
+    <figure>
+      <bbe-gpuorg data-widget></bbe-gpuorg>
+      <figcaption>The programming model (grid, thread block, warp, lane) and
+      the hardware it runs on (SMs, each with a register file and shared
+      memory, and global memory shared by all of them).</figcaption>
+    </figure>
+
+    <p>A reduction follows this hierarchy exactly. Each thread first sums
+    its own elements in a register. Then the lanes of each warp combine
+    their partial sums with shuffles, the warps of each CTA combine through
+    shared memory, and, if the sum spans more than one CTA, the CTAs combine
+    through global memory. Each of these steps fixes part of the order.</p>
+
+    <h3>Why threads own strided elements</h3>
+
+    <p>The first step, which elements each thread sums, is decided by how
+    memory is read. When a warp executes a load instruction, the hardware
+    collects the 32 addresses its lanes asked for and fetches the memory
+    that covers them, in 32-byte sectors. If the 32 lanes ask for 32
+    consecutive fp32 values, that is 128 contiguous bytes: four sectors,
+    every byte used. If they ask for 32 values that are far apart, the
+    hardware has to fetch 32 sectors and uses 4 bytes out of each. Without
+    help from caches, that is an eighth of the bandwidth.</p>
+
+    <p>Now consider the obvious way to split a row among <i>T</i> threads:
+    give each thread a contiguous chunk. At each step of its loop, thread
+    <i>t</i> reads the next element of its own chunk, so at any moment the
+    32 lanes of a warp are reading addresses one chunk apart, which is the
+    bad case. The fix is to interleave: at step <i>k</i>, thread <i>t</i>
+    reads element <i>kT + t</i>. Then each load instruction reads a
+    contiguous run, and thread <i>t</i> ends up owning elements <i>t</i>,
+    <i>t + T</i>, <i>t + 2T</i>, and so on. This is the standard
+    <code>for (i = threadIdx.x; i &lt; n; i += blockDim.x)</code> loop that
+    appears in nearly every reduction kernel. If the kernel also uses
+    vector loads, where each lane reads four floats with one instruction,
+    thread <i>t</i> owns groups of four, strided by <i>4T</i>.</p>
+
+    <figure>
+      <bbe-coalesce data-widget></bbe-coalesce>
+      <figcaption>One load instruction of one warp, over a row of 256
+      fp32 values.</figcaption>
+    </figure>
+
+    <p>With contiguous chunks of 8, the lanes' addresses are 32 bytes
+    apart, so one load touches 32 sectors and uses 128 of the 1024 bytes
+    fetched. With the strided loop, the 32 lanes read one 128-byte line and
+    use all of it. With four-wide vector loads, each lane reads 16 bytes and
+    the warp reads 512 contiguous bytes. Stepping through iterations shows
+    the strided pattern walking along the row, which is where the
+    <i>t</i>, <i>t + T</i>, <i>t + 2T</i> ownership comes from.</p>
+
+    <p>The consequence for numerics is that the order each thread sums in is
+    set by <i>T</i>, the number of threads in the block, and by the vector
+    width. Both are performance parameters. A kernel that picks a different
+    block size for a different row length (as <code>torch.softmax</code>
+    does) also picks a different summation order.</p>
+
+    <figure>
+      <bbe-hwmap data-widget></bbe-hwmap>
+      <figcaption>One row of 64 elements over 8 threads, followed all the
+      way to the final sum.</figcaption>
+    </figure>
+
+    <p>The counts are reduced for legibility; a real thread block has 128
+    to 1024 threads. The 64 values and the shuffle tree that combines the
+    per-thread sums are the same in all three cases. Only the assignment of
+    elements to threads changes, and the three totals come out one fp32
+    step apart: 92025, 92025.0078125 and 92025.015625, around an exact sum
+    of 92025.0096. Here the strided mapping happens to give the correctly
+    rounded result; with other values it would be a different one.</p>
+
+    <p>Kernels that consume the output of a matrix multiply have a different
+    constraint. Their data is already in registers, laid out however the
+    tensor-core instruction left it. On Ampere and Hopper, for example, an
+    MMA's output row is spread over a group of four threads, each holding
+    two adjacent columns out of every eight, so a row sum is a per-thread sum
+    followed by a shuffle across the four. On Blackwell the accumulator
+    lives in a separate tensor memory, and a kernel can load a whole row
+    into one thread. Even then the thread usually does not sum it
+    sequentially. A floating-point add takes several cycles to produce its
+    result, so a single running sum would make every add wait for the
+    previous one. Instead the thread keeps several independent partial
+    sums (eight, say, with element <i>8i + j</i> going to accumulator
+    <i>j</i>) and combines them at the end. That is the "8 interleaved
+    lanes" order in the first widget of this section, and it exists purely to keep the
+    arithmetic units busy.</p>
+
+    <h3>Combining the partial sums</h3>
+
+    <p>The per-thread partial sums are then combined. Within a warp, lanes
+    exchange values through shuffle instructions. In a butterfly, each lane
+    adds the value of the lane 16 positions away, then 8, then 4, 2 and 1.
+    Every lane ends with the same bits, because each pair adds the same two
+    values. Running the offsets in the opposite order (1, 2, 4, ...) builds
+    a different tree, and that is one more hidden choice. Across warps, each
+    warp writes its result to shared memory, the block waits at a barrier
+    (<code>__syncthreads()</code>), and one warp loads the warp results and
+    combines them with another shuffle. Across thread blocks, there are two options. The
+    blocks can add their results into global memory with atomic adds, in
+    whatever order they happen to finish. Or they can write them to a
+    buffer that a second pass (or a semaphore-ordered sequence of adds)
+    combines in a fixed order.</p>
+
+    <figure>
+      <bbe-hwtree data-widget></bbe-hwtree>
+      <figcaption>The levels of a GPU reduction: lanes within a warp, warps
+      within a block, blocks within the grid. Counts are reduced for
+      legibility (a real warp has 32 lanes, so the butterfly has five
+      steps).</figcaption>
+    </figure>
+
+    <p>Some concrete cases:</p>
+
+    <ul>
+      <li>A hand-written attention kernel on Blackwell might sum each row of
+      128 probabilities in one thread with eight independent accumulators
+      (element <code>8i + j</code> goes to accumulator <code>j</code>), add
+      the previous row sum into accumulator 0 before starting, and combine
+      the accumulators with a fixed tree such as
+      <code>((0+2)+(4+6)) + ((1+3)+(5+7))</code>. The exact recipe is
+      whatever kept the pipeline full.</li>
+      <li>Flex attention, for head_dim 128, has two threads per row. Each sums
+      its 64 contiguous columns left to right, the two partial sums are
+      added, and the result is combined with the previous row sum by an
+      fma. For head_dim 64 the tile layout changes and there is one thread
+      per row. The order follows from Inductor's tile configuration table,
+      which is keyed on head_dim and GPU generation.</li>
+      <li><code>torch.softmax</code> picks one of four CUDA kernels based on
+      the row length (and a fifth, the warp softmax, for rows up to 2048).
+      Each assigns elements to threads differently: thread <code>t</code>
+      owns <code>t + 1024i</code> for rows up to 9216, four-wide vectors
+      above that, and so on, followed by a shuffle-down tree over the 32
+      lanes of a warp and another over the warp totals. A spec has to
+      dispatch on the row length the same way.</li>
+    </ul>
+
+    <p>An order that is fixed for a given shape is deterministic: run the
+    kernel twice and you get the same bits. A reduction done with atomic
+    adds is not. Each thread adds its partial result into a shared
+    accumulator whenever it finishes, so the order is whatever the hardware
+    scheduler happened to do. FlashAttention 4's backward accumulates dQ
+    this way by default. In PyTorch's deterministic mode it uses semaphores
+    to force the partial results to arrive in a fixed order instead. In
+    practice only a handful of elements differ between two atomic runs, by
+    a few ulps. That is a small effect, but it means that two runs of the
+    same program on the same inputs are not the same function, and no spec
+    can match both.</p>
+
+    <p>One more case is worth knowing about, though it does not come up in
+    the attention kernels below. Some libraries choose a reduction strategy
+    (split-K for a matmul, for instance) based on the overall problem size.
+    Then the order used for one row of a batch depends on how many other
+    rows are in the batch, and the same input gives a different output
+    depending on what it was batched with. "Batch-invariant" kernels exist
+    to rule this out.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="fma">3. Fused multiply-add</h2>
+
+    <p>Every modern GPU and CPU has a fused multiply-add instruction,
+    <code>fma(a, b, c)</code>, which computes <code>a * b + c</code> with a
+    single rounding at the end. Written as two operations, <code>a * b +
+    c</code> rounds twice: once after the multiply and once after the add.
+    The fused version is faster and usually more accurate, but it is a
+    different function.</p>
+
+    <figure>
+      <bbe-fma data-widget></bbe-fma>
+      <figcaption><code>a = b = 1 + 2<sup>&minus;12</sup></code>,
+      <code>c = &minus;(1 + 2<sup>&minus;11</sup>)</code>.</figcaption>
+    </figure>
+
+    <p>The exact product is 1 + 2<sup>&minus;11</sup> +
+    2<sup>&minus;24</sup>, one bit too long for fp32's 24-bit significand.
+    The last bit is exactly half an ulp, a tie, and rounds down to the even
+    neighbour. With <code>c</code> chosen to cancel the rounded product, the
+    unfused expression gives exactly 0. The fused one keeps the product
+    exact until the end and gives 2<sup>&minus;24</sup>: precisely the bit
+    that the separate rounding threw away.</p>
+
+    <p>The important question is who decides whether a given
+    <code>a * b + c</code> is fused. Sometimes the source code says so
+    explicitly. More often the compiler decides. "Contraction" is the
+    compiler optimization that turns a multiply followed by an add into an
+    fma. C compilers control it with <code>-ffp-contract</code>; NVCC
+    contracts by default; Triton enables it by default
+    (<code>enable_fp_fusion=True</code>), which tells LLVM it may fuse
+    aggressively. Whether a particular multiply and add actually get fused
+    then depends on the details of the compiler's pattern matching, which
+    can depend on code that looks unrelated. We will see a striking example
+    of that in <a href="#compiler">section 9</a>.</p>
+
+    <p>Eager PyTorch has its own version of this. <code>torch.addcmul(c, a,
+    b)</code> happens to compute a correctly fused fma on the build used
+    here, because its CUDA kernel was contracted when PyTorch was compiled.
+    That is a property of the kernel, not a promise of the operator. A spec
+    that needs an fma should say "fma" with an operation that is guaranteed
+    to be one.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="fastmath">4. Fast math</h2>
+
+    <p>"Fast math" is a bundle of permissions a programmer can give a
+    compiler to trade exactness for speed. The details vary, but on GPUs they
+    usually include the following, each of which changes bits:</p>
+
+    <ul>
+      <li><b>Approximate transcendental functions.</b> NVIDIA GPUs have a
+      special function unit (MUFU) that computes <code>2^x</code>,
+      <code>1/x</code>, <code>log2(x)</code> and a few others in one
+      instruction: <code>ex2.approx.f32</code>, <code>rcp.approx.f32</code>,
+      <code>lg2.approx.f32</code>. These are within a stated error bound of
+      the true value: for example, <code>ex2.approx</code> has a maximum
+      relative error of 2<sup>&minus;22.5</sup> in its primary range, and
+      <code>rcp.approx</code> is within 1 ulp. <code>torch.exp2</code> in
+      eager mode does not compile to a bare
+      <code>ex2.approx</code>; it goes through CUDA's math library, a routine with different rounding. So <code>exp2</code> inside a
+      kernel and <code>torch.exp2</code> outside it are different functions,
+      and the difference is visible in the last bit or two.</li>
+      <li><b>Approximate division.</b> Triton lowers fp32 <code>/</code> to
+      <code>div.full.f32</code>, which is within 2 ulp and is not IEEE
+      division. FlashAttention 4 avoids division altogether and multiplies by
+      <code>rcp.approx(ℓ)</code>.</li>
+      <li><b>Flushing subnormals.</b> The <code>.ftz</code> variants of
+      instructions treat subnormal inputs and outputs as zero. In attention
+      this happens to be unobservable, but in general it is another
+      difference.</li>
+      <li><b>Reassociation and contraction.</b> Permission to reorder sums
+      (section 2) and to fuse multiplies and adds (section 3).</li>
+    </ul>
+
+    <h3>How a GPU computes 2<sup>x</sup></h3>
+
+    <p>It helps to look at how an exponential is actually computed. Write
+    <code>x = i + f</code>, with <code>i</code> an integer and
+    <code>f</code> in [0, 1). Then 2<sup>x</sup> = 2<sup>i</sup> &middot;
+    2<sup>f</sup>. The first factor is free: a floating-point number already
+    stores a power of two in its exponent field, so 2<sup>i</sup> is just
+    <code>i + 127</code> written into those eight bits. Only
+    2<sup>f</sup>, a number between 1 and 2, has to be approximated, and
+    any approximation of it on one interval works for every <code>x</code>.
+    The hardware's <code>ex2.approx</code> does this with tables and
+    interpolation inside the MUFU. Software can do it with a short
+    polynomial evaluated on the ordinary fma units, and FlashAttention 4
+    does exactly that for some of its exponentials, so that the MUFU and the
+    fma units share the work.</p>
+
+    <figure>
+      <bbe-transc-ex2 data-widget></bbe-transc-ex2>
+      <figcaption>FlashAttention 4's software exp2, emulated bit for bit on
+      fp32 values.</figcaption>
+    </figure>
+
+    <p>The code uses two bit-level tricks. To get &lfloor;x&rfloor;, it adds
+    1.5&middot;2<sup>23</sup> to <code>x</code> with the rounding mode set
+    to round down. Near 1.5&middot;2<sup>23</sup>, consecutive fp32 values
+    are exactly 1 apart, so the sum lands on the whole number below
+    <code>x + 1.5&middot;2<sup>23</sup></code>, and &lfloor;x&rfloor; ends
+    up in the low bits of the significand (step 1). Subtracting
+    1.5&middot;2<sup>23</sup> again recovers &lfloor;x&rfloor; as a float,
+    and one more subtraction gives <code>f</code> (step 2). For negative
+    <code>x</code> between &minus;1 and 0 that last subtraction can itself
+    round, which is one more place the emulation can depart from exact
+    arithmetic. Then, instead of multiplying by 2<sup>&lfloor;x&rfloor;</sup>,
+    it shifts &lfloor;x&rfloor; into the exponent position and adds it to
+    the bit pattern of the polynomial's result as an integer (steps 4 and
+    5). That adds &lfloor;x&rfloor; to the exponent and leaves the
+    significand alone, so 2<sup>&lfloor;x&rfloor;</sup> is exact, and every
+    difference from the true value comes from the polynomial. It also means
+    the error pattern on [0, 1) repeats for every other unit interval.</p>
+
+    <p>Every choice in that recipe changes bits: the degree of the
+    polynomial, its coefficients, and whether each Horner step is one fma or
+    a multiply followed by an add. The cubic that FlashAttention 4 uses is
+    off from the correctly rounded 2<sup>x</sup> by up to about 1400 fp32
+    ulps, far outside the hardware instruction's error bound. That is fine
+    for attention, because the result is rounded to bf16 right afterwards,
+    and one bf16 ulp is 65536 fp32 ulps; after that rounding, about 1% of
+    values differ from what the correctly rounded exponential would give. A
+    degree-5 polynomial is within 2 ulps and changes almost nothing after
+    rounding to bf16, but costs two more fmas per element.</p>
+
+    <figure>
+      <bbe-transc-err data-widget></bbe-transc-err>
+      <figcaption>Error of the software 2<sup>x</sup> against the exact
+      value, for two polynomial degrees and two ways of evaluating
+      them.</figcaption>
+    </figure>
+
+    <p>The shaded band is the documented error bound of the hardware
+    <code>ex2.approx</code>. Any fp32 value inside it would be an acceptable
+    answer from the hardware, and NVIDIA does not say which one the
+    hardware returns. At degree 3 the band is thinner than a line: the
+    cubic is not a valid <code>ex2.approx</code>, only a good enough exp2
+    for values about to be rounded to bf16. At degree 5 the emulation stays
+    inside the band, so it is one of the functions the hardware instruction
+    would be allowed to be, and it still disagrees with the correctly
+    rounded result on most inputs. Switching Horner's rule from fma to a
+    separate multiply and add changes the bits on about one input in
+    six.</p>
+
+    <p>How much of the emulation a kernel uses is itself a tuning decision.
+    In FlashAttention 4, the fraction of exponentials computed in software
+    depends on the head dimension, on whether the mask is causal, and on the
+    GPU: on B200 it is nonzero, and on GB300, whose MUFU is faster, it is
+    turned off. The same kernel, on the same inputs, computes a different
+    function on the two machines.</p>
+
+    <h3>Three ways to divide</h3>
+
+    <p>Division has the same structure: one source expression,
+    <code>x / y</code>, can become three different instructions. CUDA C++
+    compiles it to <code>div.rn.f32</code>, which is correctly rounded,
+    unless you pass <code>--use_fast_math</code>. Triton compiles it to
+    <code>div.full.f32</code>, which is within 2 ulps. A kernel that wants to
+    save more time computes <code>rcp.approx(y)</code> once and multiplies
+    by it: the reciprocal is within 1 ulp of <code>1/y</code>, and the
+    multiply rounds again.</p>
+
+    <figure>
+      <bbe-transc-div data-widget></bbe-transc-div>
+      <figcaption>The fp32 values each instruction is permitted to return for
+      the same quotient.</figcaption>
+    </figure>
+
+    <p>Only <code>div.rn</code> pins down a single answer. For 3/7 the
+    reciprocal route cannot produce the correctly rounded quotient at all:
+    whichever of the two permitted reciprocals the hardware returns, the
+    product rounds to a neighbour of it. For 1/3, one permitted reciprocal
+    gives the correctly rounded result and the other does not, so whether
+    the kernel agrees with IEEE division depends on a choice NVIDIA does not
+    document.</p>
+
+    <h3>Functions defined by a bound</h3>
+
+    <p>The approximate instructions raise a problem the earlier sections did
+    not. Rounding, reduction order and fma are all defined exactly: given the
+    order, anyone can compute the result in software. A polynomial emulation
+    is defined exactly too. The MUFU instructions are only defined by an
+    error bound. NVIDIA does not publish the exact function, so a spec cannot
+    compute it from first principles; the best it can do is call the same
+    instruction. The specs here do that, through PyTorch's inline-assembly
+    elementwise operator, so each one is literally "run
+    <code>ex2.approx.ftz.f32</code> on every element." We will come back to
+    this distinction at the end.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="constants">5. Constants and casts</h2>
+
+    <p>The last of the easy sources is where values get rounded outside the
+    arithmetic you are looking at.</p>
+
+    <p>Constants are computed on the host, usually in double precision, and
+    then rounded to fp32 when they enter the kernel. Where the rounding
+    happens matters. FlashAttention 4 computes its scores in raw units and folds the
+    softmax scale and the change of base into one constant,
+    <code>c = fp32(fp32(1/sqrt(d)) * fp32(log2 e))</code>: two constants
+    rounded to fp32, multiplied in fp32, rounded again. Computing
+    <code>1/sqrt(d) * log2 e</code> in double and rounding once can give a
+    different <code>c</code>, and every probability in the kernel
+    inherits it.</p>
+
+    <p>Even simple expressions hide this. In PyTorch, dividing a CUDA tensor
+    by a Python number, <code>x / s</code>, is implemented as
+    <code>x * (1/s)</code> with the reciprocal rounded to fp32, which is
+    not the same as dividing by <code>s</code>. Two reference
+    implementations of attention that both apply "the softmax scale" can
+    disagree because one divides the scores by <code>sqrt(d)</code> and the
+    other multiplies <code>q</code> and <code>k</code> by
+    <code>sqrt(scale)</code> each before the matmul. SDPA's math backend
+    does the latter.</p>
+
+    <p>Casts in the middle of a computation are the other place. Attention
+    kernels compute the probabilities <code>P̃</code> in fp32, then round them
+    to bf16 to feed the tensor core for <code>P̃ V</code>. The row sum
+    <code>ℓ</code> is computed from the fp32 values. So the numerator and
+    the denominator of the softmax use slightly different weights. That is a
+    deliberate choice and the largest single rounding in the forward pass.
+    A spec has to cast at the same place.</p>
+
+    <p>If you control all five of these things (the sequence of operations,
+    the reduction orders, which operations are fused, which approximate
+    instructions are used, and where constants and casts round), then you can
+    write a program in eager PyTorch that matches a kernel bit for bit,
+    with one exception. Ordinary eager PyTorch elementwise arithmetic,
+    maxima and dtype casts are already exact and deterministic. The
+    exception is the matmul.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="tensorcore">6. The tensor core is not an fp32 matmul</h2>
+
+    <p>A bf16 matmul with fp32 accumulation on an H100 or B200 runs on the
+    tensor core. It is natural to assume that the tensor core computes each
+    output as an fp32 dot product, perhaps in some unknown order. It does
+    not. The PTX ISA is explicit that it does not promise anything: for
+    <code>mma</code>, <code>wgmma</code> and <code>tcgen05.mma</code>,
+    "the accumulation order, rounding, and handling of subnormal inputs are
+    unspecified."</p>
+
+    <p>What the hardware actually does has been worked out by experiment.
+    Khattak and Mikaitis (<i>Accurate Models of NVIDIA Tensor Cores</i>,
+    2025) give a model that reproduces recorded hardware outputs exactly.
+    For bf16 or fp16 inputs on Hopper and Blackwell, one instruction
+    consumes 16 elements of the inner dimension and acts as a single
+    "block FMA":</p>
+
+    <ol>
+      <li>The 16 products are computed exactly.</li>
+      <li>The fp32 accumulator is added in as a 17th term.</li>
+      <li>All 17 terms are aligned to the largest exponent among them.</li>
+      <li>Each aligned term keeps 2 integer bits and 25 fraction bits relative
+      to that exponent. Lower bits are truncated, not rounded.</li>
+      <li>The truncated terms are summed exactly, and the result is
+      normalized and truncated to fp32 (round toward zero).</li>
+    </ol>
+
+    <figure>
+      <bbe-blockfma data-widget></bbe-blockfma>
+      <figcaption>One tensor-core instruction with K = 16: sixteen bf16
+      products and the fp32 accumulator.</figcaption>
+    </figure>
+
+    <p>Each strip is one addend, shifted so that all 17 line up with the
+    largest exponent among them. Bits that fall past the cut are dropped
+    before anything is added, and the exact sum of what remains is cut to
+    24 significant bits at the end. Below the strips, the same 17 terms go
+    through an fp32 fma chain, one rounding per term, for comparison. On
+    random inputs the two disagree most of the time (on 369 of the 600
+    input sets the widget cycles through), but not always. Making the
+    accumulator large, as it becomes after many blocks, pushes more of the
+    products' bits past the cut.</p>
+
+    <p>The consequences are larger than they look. The tensor core's sum is
+    biased toward zero, since it truncates. Its result depends on which 16
+    products share an instruction and on the value the accumulator has when
+    each block arrives. Compared with an IEEE fp32 matmul of the same bf16
+    inputs, about 70% of output elements differ.</p>
+
+    <p>The accumulator being an input to the block also matters.
+    <code>acc + A @ B</code>, computed as a matmul followed by a separate
+    fp32 add, gives different bits from a matmul that carries
+    <code>acc</code> into its first block. cuBLAS's <code>addmm</code> does
+    the former, in its epilogue. Attention kernels do the latter: the
+    rescaled output accumulator <code>O * alpha</code> enters the
+    <code>P̃ V</code> matmul as the accumulator of its first block.</p>
+
+    <p>For 16-bit inputs with fp32 accumulation, H100 (WGMMA), B200 and GB300
+    (tcgen05) compute the same function. Other cases differ: A100 uses
+    blocks of 8 products and one fewer fraction bit, and fp8 on Hopper keeps
+    only 13 fraction bits. The fp8 case is why DeepSeek-V3 periodically
+    moved its partial sums out of the tensor core into fp32 registers
+    (every 128 elements of the inner dimension) during training.</p>
+
+    <p>Given the model, a spec can implement the tensor core in plain
+    PyTorch (<code>mma_model</code> in the specs here), and it agrees with
+    Triton's <code>tl.dot</code>, with cuBLAS, and with the published
+    hardware vectors for B200 and H100 on every input tried. For speed, the
+    specs actually call a small Triton kernel around <code>tl.dot</code>
+    and use the PyTorch model to validate it.</p>
+
+    <p>fp32 matmuls without the tensor core are a separate case. With TF32
+    off, cuBLAS SGEMM computes each output as one fma chain with the inner
+    index ascending, for the shapes used here. That holds for matrices with
+    at least 32 rows. For 16 rows cuBLAS switches to a different algorithm.
+    None of the split-K orders tried reproduce it, and cuBLAS is closed
+    source, so that case is left unmodelled. This is the one place in this
+    study where a spec could not be written.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="online">7. Online softmax</h2>
+
+    <p>With the primitives in hand, we can turn to attention. For one query
+    row with scores <code>s_j = scale * q &middot; k_j</code> over the
+    visible keys, attention is</p>
+
+    <pre><code>out = sum_j exp(s_j) v_j / sum_j exp(s_j)
+lse = log sum_j exp(s_j)</code></pre>
+
+    <p>A flash-attention kernel never materializes the whole row of scores.
+    It visits the keys one tile at a time (128 keys, typically) and keeps
+    three running values per query row: a reference score <code>m</code>, a
+    sum <code>ℓ</code>, and an output row <code>O</code>. After any number
+    of tiles, in real arithmetic,</p>
+
+    <pre><code>ℓ     = sum over keys seen so far of exp(s_j - m)
+O     = sum over keys seen so far of exp(s_j - m) v_j
+O / ℓ = attention over the keys seen so far
+lse   = m + log ℓ</code></pre>
+
+    <p>Neither <code>O / ℓ</code> nor <code>m + log ℓ</code> depends on
+    <code>m</code>. The reference is there only to keep the exponentials in
+    range. It has to be near the largest score seen, but it does not have
+    to equal it. When a tile brings in larger scores, the kernel may move
+    the reference from <code>m</code> to <code>m'</code>; every term of
+    <code>ℓ</code> and <code>O</code> then has to be multiplied by
+    <code>alpha = exp(m - m')</code>. The kernel rescales both. Rescaling
+    one and not the other would change <code>O / ℓ</code>.</p>
+
+    <p>This is where two kernels that implement the same algorithm part
+    ways. Flex attention moves the reference to the running maximum on every
+    tile. FlashAttention 4 uses "lazy rescaling": it only moves the
+    reference when the new maximum exceeds it by more than 8 (in log2
+    units, for 16-bit inputs). Otherwise it leaves <code>alpha = 1</code>
+    and skips the multiply of the whole <code>O</code> row, which is the
+    point of the threshold. With lazy rescaling, <code>m</code> is often below the
+    largest score seen, so <code>p = exp(s - m)</code> is a weight that can
+    be as large as 2<sup>8</sup> = 256, not a probability.</p>
+
+    <figure>
+      <bbe-online data-widget></bbe-online>
+      <figcaption>One query row, two key tiles, scale 1, scalar values
+      <code>v</code>.</figcaption>
+    </figure>
+
+    <p>In the lazy-rescaling scenarios the dashed line is the threshold, 8
+    log2 units above the current reference. The second tile's maximum of 5
+    is 2 nats, or 2.89 log2 units, above the reference of 3, under the
+    threshold, so the reference stays and <code>alpha = 1</code>; the
+    weights 7.389 and 2.718 are both larger than 1. In the third scenario
+    the second tile's maximum is 12 nats (17.3 log2 units) above the first,
+    over the threshold, so even lazy rescaling moves the reference.</p>
+
+    <p>The rounded column follows the kernel recipe in miniature: fp32
+    weights <code>p</code>, an fp32 row sum, <code>P̃</code> rounded to bf16
+    before it multiplies <code>v</code>, and fp32 accumulation of
+    <code>O</code>. (The exponential is computed in double and rounded once,
+    a stand-in for whichever exp a kernel uses.) After the first tile, the
+    exact and rounded <code>ℓ</code> agree to every printed digit, because
+    <code>ℓ</code> sums the fp32 weights. <code>O</code> is already 0.05%
+    low, because it used the bf16 weights: 0.36788 became 0.36719. After the
+    second tile, the exact <code>O / ℓ</code> is 4.331542 under both
+    policies. That is the invariant. The rounded value is 4.324174 if the
+    reference stays put and 4.330957 if it moves, which is the bitwise
+    consequence of a decision that is invisible in real arithmetic. It
+    survives the bf16 cast of the output, as 4.3125 against 4.34375, while
+    the LSE agrees to every printed digit.</p>
+
+    <p>Two more properties of the loop matter for a spec. First, the loop
+    is a fold, <code>(m, ℓ, O) &larr; tile_update(m, ℓ, O, tile)</code>, and
+    the fold is not associative, just like the sums inside it. The order in
+    which tiles are visited is part of the function. Second, where the tile
+    boundaries fall also matters, because they decide when rescaling and
+    rounding happen.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="variants">8. Two kernels, one loop</h2>
+
+    <p>A hand-written CuTe DSL kernel like FlashAttention 4 and flex
+    attention's Triton template look nothing alike. Once everything that does
+    not affect the output bits is stripped away (warp specialization, tensor
+    memory, pipelining, which warps do which work), they are the same loop
+    with a handful of different decisions. A single parameterized spec can
+    cover both, and the parameters are the list of decisions.</p>
+
+    <figure>
+      <bbe-variants data-widget></bbe-variants>
+      <figcaption>One step of the online-softmax loop with its decision
+      sites. Toggle between an FA4-style kernel and flex attention to see
+      each one's choice. The purple choice is made by the compiler, not the
+      source.</figcaption>
+    </figure>
+
+    <p>In the spec, these decisions are the fields of a <code>Variant</code>,
+    each a closed set of named options whose branch in the code is the
+    arithmetic it names. Flex attention's variant is computed from the head
+    dimension, since its tile sizes come from Inductor's configuration
+    table:</p>
+
+    <pre><code>def flex_variant(head_dim):
+    block_m, block_n, _, num_warps = SM100_FLEX_CONFIG[head_dim]
+    return Variant(
+        block_m=block_m, block_n=block_n, sparse_block=128,
+        order="partial_then_full",
+        score_units="log2",
+        probability="exp2_sub",
+        fma_contraction="unmasked_tiles",
+        rescale_threshold=0.0,
+        row_sum="spans_then_fma", sum_spans=num_warps * 32 // block_m,
+        normalize="div_full",
+        lse="log2_units",
+    )</code></pre>
+
+    <p>An FA4-style kernel would set <code>rescale_threshold=8.0</code>,
+    keep its scores in raw units with the scale folded into the exponent's
+    fma, normalize with
+    <code>rcp.approx</code>, and use its own lane order for the row sum.
+    Some choices are coupled (a running max kept in raw units goes with the
+    fused-scale exponent), and the spec checks those couplings when a
+    variant is constructed. Read this way, two declarations are an inventory
+    of exactly how two kernels differ.</p>
+
+    <h3>Tile order</h3>
+
+    <p>The visiting order deserves a picture. In a common training setup,
+    many documents are packed into one long sequence and each query
+    attends to keys from the start of its own document up to itself
+    ("block-causal" visibility). At the granularity of 128 &times; 128
+    blocks, a block of the attention matrix is either empty, full (every
+    query in it sees every key in it), or partial.</p>
+
+    <figure>
+      <bbe-tileorder data-widget></bbe-tileorder>
+      <figcaption>A block-causal mask over three packed documents. Pick a
+      row of query blocks to see the order in which each kernel visits its
+      key blocks.</figcaption>
+    </figure>
+
+    <p>An FA4-style kernel visits a query block's visible key blocks from the
+    last (the one on the diagonal) down to the first. Flex attention makes two passes,
+    first over the partial blocks in ascending order and then over the full
+    blocks in ascending order, because its block mask keeps the two kinds in
+    separate lists. Since the fold is not associative, the two orders give
+    different bits even with identical arithmetic in each step.</p>
+
+    <h3>What the spec looks like</h3>
+
+    <p>Here is the core of the per-tile update for flex attention, lightly
+    trimmed. Every
+    line is either ordinary eager PyTorch, which is already exact, or a
+    named primitive: <code>nm.mma</code> (the tensor core),
+    <code>nm.ex2</code> (the MUFU instruction), <code>nm.fma</code> (one
+    rounding), and the named reduction orders.</p>
+
+    <pre><code>s = nm.mma(q_t, kT_t)                       # Q K^T on the tensor core
+s_scaled = s * fp32(scale)
+s = torch.where(visible, s_scaled, -inf) * fp32(LOG2_E)
+m_new, m_used, alpha = running_max(m_old, s.amax(-1), variant)
+
+p = nm.ex2(s - m_used)
+if variant.fma_contraction == "unmasked_tiles":
+    p = where(unmasked, nm.ex2(nm.fma(s_scaled, LOG2_E, -m_used)), p)
+
+l_new = nm.fma(l_old, alpha, span_sums(p))        # flex's row-sum order
+
+# P is rounded to bf16 for the MMA; the row sum used fp32 P.
+# O * alpha enters the first 16-key block as the accumulator.
+o_new = nm.mma(p.to(bfloat16), v_t, acc=o_old * alpha)</code></pre>
+
+    <p>The whole forward spec is about a hundred lines. With
+    <code>variant=flex_variant(head_dim)</code> it is bitwise equal to
+    compiled flex attention, output for output, on a sweep of 14 shapes
+    (head_dim 64 and 128, several GQA ratios, lengths from 1024 to 12288
+    including lengths that are not multiples of 128, batch 1 to 3). It runs
+    a few dozen times slower than the kernel, which is fast enough to use
+    as a test oracle.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="compiler">9. The compiler is part of the semantics</h2>
+
+    <p>The <code>fma_contraction</code> field is the strangest entry in the
+    variant, and it is worth explaining how it was found.</p>
+
+    <p>Flex attention's Triton template computes the probabilities with one
+    line, <code>p = exp2(qk * RCP_LN2 - m)</code>. There is no fma in the
+    source, and a spec that computes exactly this line, with two roundings,
+    does not match the kernel. The difference was located by dumping the
+    kernel's own running <code>m</code>, <code>ℓ</code> and <code>O</code>
+    from an instrumented copy and comparing them with the spec step by step,
+    and then confirmed in the PTX.</p>
+
+    <p>The template instantiates the loop body twice: once for partial
+    blocks, which apply the mask, and once for full blocks, which do not.
+    The same source line therefore appears in two contexts, and LLVM
+    compiles it differently in each.</p>
+
+    <figure>
+      <bbe-contraction data-widget></bbe-contraction>
+      <figcaption>The same source line in the two instantiations of flex
+      attention's loop body. On partial blocks a select sits between the
+      multiply and the subtraction, and the fma pattern does not match. On
+      full blocks it does.</figcaption>
+    </figure>
+
+    <p>The mechanism takes three facts about the compiler:</p>
+
+    <ul>
+      <li>Triton tells LLVM it may fuse floating-point operations freely
+      (<code>AllowFPOpFusion = Fast</code> when
+      <code>enable_fp_fusion</code> is on, which is the default).</li>
+      <li>LLVM's DAG combiner rewrites <code>fsub(fmul(x, c), m)</code> into
+      <code>fma(x, c, -m)</code>. It does not look through an intervening
+      select.</li>
+      <li>On the partial path, the mask is a select:
+      <code>select(valid, s, -inf)</code>. LLVM's InstCombine pushes the
+      following multiply into the select's arms, because the
+      <code>-inf</code> arm constant-folds. Now the subtraction's operand is
+      a select, not a multiply, and the fma pattern does not apply. On the
+      full path there is no mask, so the multiply feeds the subtraction
+      directly and gets fused.</li>
+    </ul>
+
+    <p>The result is that one line of Triton computes two different
+    arithmetic expressions in the same kernel: <code>sub.f32</code> after a
+    separate multiply on partial blocks, and <code>fma.rn.f32</code> on full
+    blocks. There is one more condition. If the sequence length is not a
+    multiple of the tile sizes, every tile is masked against the end of the
+    sequence, the select is always present, and nothing is fused. The flex
+    variant derives this from the shape.</p>
+
+    <p>The lesson here is about method as much as about compilers. The
+    PTX for flex attention was read early on, but the excerpt that was read
+    came from the masked path and was taken as representative. A count of
+    the instructions would have caught it immediately: the kernel contains
+    132 <code>fma.rn.f32</code> instructions, and its source contains no
+    fma. The rule that came out of this is to take a census of every
+    floating-point instruction in the compiled kernel first, then account
+    for every one of them against a line of the spec (or mark it as not
+    affecting the output, with a reason), and only consider the reading
+    done when the ledger balances. Code that is duplicated in the source
+    is exactly where compilers diverge, so each copy has to be read on its
+    own.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="shape">10. The wrapper and the shape are part of the semantics</h2>
+
+    <p>The same theme shows up one level higher. A kernel's source
+    describes a family of functions; which member you get depends on the
+    configuration the calling code picks, and that configuration often
+    depends on the shape of the inputs.</p>
+
+    <p>Kernel libraries routinely choose among configurations in their
+    Python wrappers: tile shapes, whether to run a pair of thread blocks as a
+    cluster that shares one larger matmul, whether to split a reduction.
+    Each choice can change how many terms one tensor-core instruction or
+    one accumulator sees, and so the bits. These choices often depend on
+    the head dimension, on which features of the kernel are in use, or on
+    the GPU, and they are made in code that is easy to overlook when you
+    read only the kernel.</p>
+
+    <p>The shape sweep turned up three cases where the function depends on
+    the shape:</p>
+
+    <ul>
+      <li>Flex attention's tile sizes and lane layout come from Inductor's
+      configuration table, keyed on head_dim, and its fma contraction depends
+      on whether the sequence length divides evenly into tiles.</li>
+      <li><code>torch.softmax</code> picks its kernel, and therefore its
+      reduction order, by row length.</li>
+      <li>cuBLAS SGEMM switches algorithm for 16-row matrices.</li>
+    </ul>
+
+    <p>The practical point is that a spec checked on one shape is a claim
+    about one shape.
+    Constants that look fixed in a kernel are often derived, and a sweep is
+    how you find out which.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="fp32ref">11. The fp32 reference is a function too</h2>
+
+    <p>It is tempting to treat an fp32 implementation of attention as the
+    ground truth and measure the bf16 kernels against it. It is a better
+    approximation of the real-number result, but it is still just another
+    function, and two fp32 references disagree with each other for the same
+    reasons the kernels do.</p>
+
+    <p>The two fp32 implementations studied here are a native reference
+    (fp32 <code>torch.matmul</code> over 256-query chunks, divide by
+    <code>sqrt(d)</code>, <code>masked_fill</code> with the most negative
+    fp32, <code>torch.softmax</code>, fp32 matmul with V, cast to bf16) and
+    PyTorch's SDPA math backend (upcast <code>q</code> and <code>k</code>,
+    multiply each by <code>sqrt(scale)</code>, matmul, additive
+    <code>-inf</code> mask, a "safe" softmax, matmul, cast). They differ in
+    where the scale is applied and how the mask is applied. Both reduce in
+    whatever order <code>torch.softmax</code> and cuBLAS choose for the
+    shape. A second spec of about fifty lines, built from the same
+    primitives (an fp32 fma-chain matmul and PyTorch's softmax reduction
+    order), matches both bit for bit wherever the softmax rows are longer
+    than 2048, apart from the 16-row cuBLAS case above. Shorter rows go to
+    the warp softmax, which was not modelled.</p>
+
+    <p>The fp32 references and the online-softmax kernels do not share a
+    structure. The fp32 path normalizes <code>P</code> before multiplying
+    by <code>V</code>; the online path normalizes <code>O</code> afterwards.
+    What they share is the vocabulary: the primitives, the typed constants
+    and the named reduction orders.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="backward">12. The backward</h2>
+
+    <p>Attention's backward pass does not keep the probabilities from the
+    forward; that would take too much memory. It keeps two things per query
+    row, the fp32 LSE and the bf16 output, and recomputes <code>P</code>
+    from the scores and the LSE. Everything else follows from that.</p>
+
+    <figure>
+      <bbe-backward data-widget></bbe-backward>
+      <figcaption>An FA4-style backward, with the accumulation orders shown.
+      dK and dV accumulate in the tensor core over query blocks; dQ is added
+      into an fp32 buffer one key tile at a time, in an order that only
+      deterministic mode fixes.</figcaption>
+    </figure>
+
+    <p>Stage by stage, the output bits of a backward with this structure
+    depend on:</p>
+
+    <ul>
+      <li><b>Preprocess.</b> <code>D = rowsum(out * dO)</code>, from the bf16
+      output. The products are exact in fp32; the sum is a per-thread
+      sequential sum followed by a butterfly across the threads of a row, in
+      whatever split the kernel uses. The LSE is converted to log2 units, one
+      fp32 multiply.</li>
+      <li><b>Per tile.</b> For each pair of a 128-row query block and a
+      128-key tile: <code>S = Q K^T</code> and <code>dP = dO V^T</code> on
+      the tensor core, the mask, <code>P = ex2(fma(S, c, -lse2))</code>, and
+      <code>dS = P * (dP - D)</code> in fp32 with no contraction. Both
+      <code>P</code> and <code>dS</code> are rounded to bf16 for the next
+      matmuls.</li>
+      <li><b>dK and dV.</b> For each key tile, the visible query blocks in
+      some fixed order, accumulated in the tensor core:
+      <code>dV += P^T dO</code>, <code>dK += dS^T Q</code>.</li>
+      <li><b>dQ.</b> For each query block, one <code>dS K</code> matmul per
+      key tile, added into an fp32 buffer (on Blackwell, typically by the
+      TMA unit's bulk reduce-add: round to nearest, subnormals flushed),
+      in arrival order or, in deterministic mode, in a fixed order.</li>
+      <li><b>GQA.</b> When several query heads share a KV head, their dK and
+      dV are reduce-added in head order.</li>
+      <li><b>Epilogue.</b> dQ and dK are scaled and cast to bf16; dV is
+      cast.</li>
+    </ul>
+
+
+    <!-- ================================================================ -->
+    <h2 id="language">13. What a spec language needs</h2>
+
+    <p>The specs are written in ordinary eager PyTorch. Looking back at what
+    had to be added, the list is short:</p>
+
+    <ul>
+      <li>a tensor-core matmul that takes the accumulator as an input and
+      has the block-FMA semantics;</li>
+      <li>an fp32 matmul with a stated order (one fma chain per output);</li>
+      <li>a guaranteed fma;</li>
+      <li>the MUFU approximations and Triton's <code>div.full</code>, each
+      as a single named instruction;</li>
+      <li>a way to state a reduction order.</li>
+    </ul>
+
+    <p>The last item is the only one that needs real design. Every order
+    met in this study (interleaved lanes, Triton's per-thread spans, PyTorch's
+    block reduce) has the same shape: sequential within a lane, then a fixed
+    small tree. A <code>sum(x, order=...)</code> primitive with that
+    vocabulary would cover all of them.</p>
+
+    <p>A few practices also turned out to matter.</p>
+
+    <p><b>No implicit conversions.</b> The specs run under a PyTorch mode
+    that rejects implicit dtype conversions: no Python numbers in
+    arithmetic, no mixed dtypes, and constants only through an explicit
+    typed constructor. It did not find any hidden conversions in the specs,
+    but making them pass it moved every constant (the scale,
+    <code>log2 e</code>, <code>ln 2</code>, <code>-inf</code>, the fill
+    values for padding) into an explicit fp32 tensor. The place where a
+    host double becomes an fp32 operand is now a visible token in the
+    source, not a promotion rule the reader has to know.</p>
+
+    <p><b>Validate the harness, not just the spec.</b> Harness bugs that
+    raised errors got fixed in minutes. The ones that produced plausible
+    output survived much longer: a check that printed MISMATCH but exited
+    with status 0, flex silently falling back to eager mode after hitting
+    the recompile limit (debugged for a while as a spec bug), results read
+    from runs of stale code. Every harness now has a negative control that
+    flips one bit of a spec output and passes only if the mismatch is
+    reported. Every run prints a hash of the code it ran. Known-dangerous
+    warnings are errors.</p>
+
+    <p><b>Keep geometry, order and arithmetic apart.</b> Which rows a tile
+    holds, the order tiles are folded in, and what one fold step computes
+    are three separate pieces of code in the spec. Keeping them apart means
+    a different kernel's schedule can be swapped in without touching the
+    arithmetic.</p>
+
+    <!-- ================================================================ -->
+    <h2 id="beyond">14. Beyond bitwise equivalence</h2>
+
+    <p>The primitives come in two kinds. Some have a complete software
+    definition: the tensor core's block FMA, fma, ordered fp32 sums. Others
+    are defined only by an error bound: <code>ex2.approx</code> is "within
+    2<sup>&minus;22.5</sup> relative error," and the hardware picks one
+    particular function inside that bound. For the second kind, the
+    documented bound already describes a set of permissible functions, and
+    the GPU's instruction is one element of it.</p>
+
+    <p>That suggests a question more useful than "are these two
+    implementations bitwise equal?": which differences are permitted? A
+    spec that says exactly which function a kernel computes is the starting
+    point for saying which other functions would be acceptable in its
+    place, and for checking that a new kernel stays inside that set.</p>
+
+    <p class="draft">[Author: this section is a placeholder for where the
+    series goes next.]</p>
+
+    <!-- ================================================================ -->
+    <h2>Caveats</h2>
+
+    <ul>
+      <li>The bitwise matches were verified on a GB300 (sm_103) with a
+      PyTorch 2.15 nightly, in bf16, with no attention sinks, dropout or
+      stochastic rounding.</li>
+      <li>Not modelled: subnormal inputs, inf and NaN, flex's LSE, the warp
+      softmax for rows up to 2048, cuBLAS for fewer than 32 rows, the SDPA
+      efficient and cuDNN backends, and the flex and fp32 backwards.</li>
+      <li>The tensor-core model's validated domain is finite inputs and
+      finite accumulators. Its handling of subnormal inputs follows the
+      published rules but is untested here.</li>
+    </ul>
+
+    <h2>References</h2>
+    <ul>
+      <li>FlashAttention 4 (CuTe DSL), <a href="https://github.com/Dao-AILab/flash-attention/tree/main/flash_attn/cute">github.com/Dao-AILab/flash-attention</a>.</li>
+      <li>F. A. Khattak, M. Mikaitis, <i>Accurate Models of NVIDIA Tensor
+      Cores</i>, arXiv:2512.07004.</li>
+      <li>M. Fasi, N. J. Higham, M. Mikaitis, S. Pranesh, <i>Numerical
+      behavior of NVIDIA tensor cores</i>, PeerJ CS 7:e330, 2021.</li>
+      <li>C. Liu et al., <i>Some Matrix Multiplication Engines Are Not As
+      Accurate As We Thought</i>, PyTorch blog, 2026.</li>
+      <li>DeepSeek-AI, <i>DeepSeek-V3 Technical Report</i>, section 3.3.2.</li>
+      <li>NVIDIA, <i>PTX ISA</i>, sections 9.7.15&ndash;9.7.16.</li>
+    </ul>
+  </main>
+
+  <!-- one tag per widget, so a missing or broken module only affects its own figure -->
+  <script type="module" src="./src/rounding.js"></script>
+  <script type="module" src="./src/gpuorg.js"></script>
+  <script type="module" src="./src/coalesce.js"></script>
+  <script type="module" src="./src/hwmap.js"></script>
+  <script type="module" src="./src/hwtree.js"></script>
+  <script type="module" src="./src/transc-ex2.js"></script>
+  <script type="module" src="./src/transc-err.js"></script>
+  <script type="module" src="./src/transc-div.js"></script>
+  <script type="module" src="./src/reduce.js"></script>
+  <script type="module" src="./src/fma.js"></script>
+  <script type="module" src="./src/blockfma.js"></script>
+  <script type="module" src="./src/online.js"></script>
+  <script type="module" src="./src/variants.js"></script>
+  <script type="module" src="./src/tileorder.js"></script>
+  <script type="module" src="./src/contraction.js"></script>
+  <script type="module" src="./src/backward.js"></script>
+</body>
+
+</html>

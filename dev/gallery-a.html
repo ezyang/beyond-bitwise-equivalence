@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gallery A: numeric widgets</title>
+<link rel="stylesheet" href="../site.css">
+<style>
+  .theme { position: fixed; top: 10px; right: 12px; font: 12px var(--sans); padding: 3px 10px; border: 1px solid var(--rule-strong);
+    border-radius: 4px; background: var(--card); color: var(--muted); cursor: pointer; }
+  h2 code { font-size: 15px; }
+</style>
+<script>if (location.hash === '#dark') document.documentElement.classList.add('dark');</script>
+</head>
+<body>
+<button class="theme" onclick="document.documentElement.classList.toggle('dark')">light / dark</button>
+<main>
+<h1>Gallery A: numeric widgets</h1>
+<p class="dek">Development page for the group-A illustrations. Every number shown is computed by exact emulation in <code>src/fp.js</code>; <code>node scripts/check-fp.mjs</code> asserts the key ones.</p>
+
+<h2><code>bbe-rounding</code>: Every operation rounds</h2>
+<bbe-rounding data-widget></bbe-rounding>
+
+<h2><code>bbe-reduce</code>: Reduction order</h2>
+<bbe-reduce data-widget></bbe-reduce>
+
+<h2><code>bbe-fma</code>: Fused multiply-add</h2>
+<bbe-fma data-widget></bbe-fma>
+
+<h2><code>bbe-blockfma</code>: The tensor core is not an fp32 matmul</h2>
+<bbe-blockfma data-widget></bbe-blockfma>
+
+<h2><code>bbe-online</code>: Online softmax</h2>
+<bbe-online data-widget></bbe-online>
+</main>
+<script type="module" src="../src/rounding.js"></script>
+<script type="module" src="../src/reduce.js"></script>
+<script type="module" src="../src/fma.js"></script>
+<script type="module" src="../src/blockfma.js"></script>
+<script type="module" src="../src/online.js"></script>
+</body>
+</html>

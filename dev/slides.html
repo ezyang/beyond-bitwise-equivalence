@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FA4-style vs flex attention: why different</title>
+<link rel="stylesheet" href="../site.css">
+<script>document.documentElement.classList.toggle('dark', (localStorage.getItem('bbe-theme') ?? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')) === 'dark');</script>
+<style>
+  /* Kernel colours, deck-wide and in widget titles: FA4-style amber, flex blue (as in the block-order widget). */
+  :root { --fa4: var(--amber); --fa4-soft: var(--amber-soft); --flex: var(--blue); --flex-soft: var(--blue-soft);
+    --fa4-text: color-mix(in srgb, var(--fa4) 70%, var(--ink)); --flex-text: color-mix(in srgb, var(--flex) 85%, var(--ink)); }
+  .k.fa4 { color: var(--fa4-text); }
+  .k.flex { color: var(--flex-text); }
+  html { scrollbar-gutter: stable; }
+  main { padding-top: 24px; }
+  .slide { display: none; }
+  .slide.on { display: block; }
+  .slide h2 { margin-top: 0; font-size: 26px; }
+  .slide h2 .n { color: var(--faint); margin-right: 8px; }
+  .t.vs { font-size: 15px; margin: 10px 0 18px; }
+  .t.vs { width: 100%; }
+  .t.vs th { width: 140px; }
+  .t.vs.cols td { width: 40%; }
+  .t.vs td code { font-size: 13.5px; }
+  .setup li { font-size: 17px; }
+  .slide math { font-size: 1.12em; }
+  .slide math[display=block] { margin: 10px 0 14px; max-width: 720px; }
+  .slide .eqs { display: grid; grid-template-columns: max-content auto; align-items: center; justify-content: start; gap: 12px 20px; margin: 12px 0 18px; }
+  .slide .eqs .lab { font-weight: 600; color: var(--muted); }
+  .slide .eqs math { justify-self: start; }
+  .t.fn { font-size: 15px; width: 100%; }
+  .t.fn td code { font-size: 13.5px; }
+  .t.fn th, .t.fn td { padding-left: 8px; }
+  .t.fn th:first-child { white-space: nowrap; }
+  .t.fn tr.grp th { color: var(--ink); padding-top: 14px; }
+  .t.fn tr.fa4 > * { background: var(--fa4-soft); }
+  .t.fn tr.flex > * { background: var(--flex-soft); }
+  .where { display: grid; grid-template-columns: max-content 1fr; gap: 24px; align-items: start; margin: 8px 0 4px; }
+  .where p { font-size: 15px; margin: 0 0 10px; }
+  .loop { margin: 8px 0 12px; width: max-content; }
+  .where .loop { margin: 0; }
+  .loop code { line-height: inherit; }
+  .loop .ch { display: inline-block; width: 1ch; }
+  .loop sup { display: inline-block; font-size: 100%; vertical-align: baseline; transform: translateY(-.35em) scale(.75); }
+  .loop .hl { display: block; margin: 0 -14px; padding: 0 14px; background: color-mix(in srgb, var(--ink) 10%, var(--panel)); }
+  .loop .cm { color: var(--faint); }
+  .nav { position: fixed; bottom: 12px; right: 16px; font: 13px var(--sans); color: var(--faint); }
+  .nav button { font: inherit; padding: 2px 9px; border: 1px solid var(--rule-strong); border-radius: 4px;
+    background: var(--card); color: var(--muted); cursor: pointer; }
+</style>
+</head>
+<body>
+<main>
+
+<section class="slide" data-slug="intro">
+  <h2>FA4-style vs flex attention: why different?</h2>
+  <div class="where">
+    <bbe-sdpa data-widget></bbe-sdpa>
+    <ul class="setup">
+      <li>Loop: FlashAttention-2, Algorithm 1 (Dao 2023), with <code>exp</code> as <code>ex2</code> and a mask</li>
+      <li>q: <code>bf16[32768, 8, 128]</code>; k, v: <code>bf16[32768, 1, 128]</code> (8:1 GQA)</li>
+      <li>Block-causal mask</li>
+      <li>Both: 128 &times; 128 tiles, fp32 <code>P̃</code> rounded to bf16 for <code>P̃ V</code>, <code>O&middot;&alpha;</code> as the MMA accumulator</li>
+    </ul>
+  </div>
+  <table class="t vs cols">
+    <tr><th></th><th class="k fa4">FA4-style</th><th class="k flex">flex attention</th></tr>
+    <tr><th>Block order</th><td>diagonal first, descending</td><td>partial blocks, then full blocks, each ascending</td></tr>
+    <tr><th>Rescale policy</th><td>only when the max grows by &gt; 8 log2 units</td><td>every tile</td></tr>
+    <tr><th>Scale placement</th><td>one fma on raw scores</td><td>mul, mul, sub (compiler fuses an fma on full blocks)</td></tr>
+    <tr><th>Row-sum order</th><td>8 interleaved accumulators, then a tree</td><td>2 spans of 64, then fma</td></tr>
+    <tr><th>Function choice</th><td><code>lg2.approx</code> for <code>lse</code> (division: same bits)</td><td><code>log2f</code> for <code>lse</code> (division: same bits)</td></tr>
+  </table>
+</section>
+
+<section class="slide" data-slug="block-order">
+  <h2><span class="n">1</span>Block order</h2>
+  <pre class="loop" data-hl="for"></pre>
+  <div style="display: grid; grid-template-columns: 450px 390px; margin-left: 80px; font-size: 15px; line-height: 1.4; color: var(--text)">
+    <p style="margin: 0; max-width: 400px"><b class="k fa4">FA4-style:</b> each query block visits its key blocks from the diagonal leftward, nearest first.</p>
+    <p style="margin: 0"><b class="k flex">flex:</b> each query block visits its partial blocks left to right, then its full blocks left to right; the block mask stores them as two separate lists.</p>
+  </div>
+  <bbe-visitorder data-widget></bbe-visitorder>
+</section>
+
+<section class="slide" data-slug="why-rescale">
+  <h2><span class="n">2</span>Why flash attention rescales</h2>
+  <div class="where">
+  <pre class="loop" data-hl="m alpha l O"></pre>
+  <div>
+  <p>For one query row with scores <math><msub><mi>s</mi><mi>j</mi></msub></math>
+  and values <math><msub><mi>v</mi><mi>j</mi></msub></math>, attention is a
+  weighted average of the values:</p>
+  <math display="block">
+    <mi>out</mi><mo>=</mo>
+    <mfrac>
+      <mrow><munder><mo>&sum;</mo><mi>j</mi></munder><msup><mi>e</mi><msub><mi>s</mi><mi>j</mi></msub></msup><msub><mi>v</mi><mi>j</mi></msub></mrow>
+      <mrow><munder><mo>&sum;</mo><mi>j</mi></munder><msup><mi>e</mi><msub><mi>s</mi><mi>j</mi></msub></msup></mrow>
+    </mfrac>
+  </math>
+  </div>
+  </div>
+  <p>To keep <math><mi>exp</mi></math> in range, kernels subtract a reference
+  <math><mi>m</mi></math> from every score. With weights
+  <math><msub><mi>p</mi><mi>j</mi></msub><mo>=</mo><msup><mi>e</mi><mrow><msub><mi>s</mi><mi>j</mi></msub><mo>&minus;</mo><mi>m</mi></mrow></msup></math>,
+  they track the denominator
+  <math><mi>ℓ</mi><mo>=</mo><mo>&sum;</mo><msub><mi>p</mi><mi>j</mi></msub></math>
+  and the numerator
+  <math><mi>O</mi><mo>=</mo><mo>&sum;</mo><msub><mi>p</mi><mi>j</mi></msub><msub><mi>v</mi><mi>j</mi></msub></math>.
+  Offline, <math><mi>m</mi></math> is the row max; online, it is the largest
+  score so far, and moving it to
+  <math><mi>m</mi><mo lspace="0" rspace="0">&prime;</mo></math> rescales what
+  has been summed:</p>
+  <div class="eqs">
+    <span class="lab">offline</span>
+    <math displaystyle="true">
+      <mi>out</mi><mo>=</mo>
+      <mfrac>
+        <mrow><munder><mo>&sum;</mo><mi>j</mi></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mi>j</mi></msub><mo>&minus;</mo><mi>m</mi></mrow></msup><msub><mi>v</mi><mi>j</mi></msub></mrow>
+        <mrow><munder><mo>&sum;</mo><mi>j</mi></munder><msup><mi>e</mi><mrow><msub><mi>s</mi><mi>j</mi></msub><mo>&minus;</mo><mi>m</mi></mrow></msup></mrow>
+      </mfrac><mo>=</mo><mfrac><mi>O</mi><mi>ℓ</mi></mfrac><mo>,</mo>
+      <mspace width="1em"/>
+      <mi>m</mi><mo>=</mo><msub><mi>max</mi><mi>j</mi></msub><msub><mi>s</mi><mi>j</mi></msub>
+    </math>
+    <span class="lab">online</span>
+    <math displaystyle="true">
+      <mi>&alpha;</mi><mo>=</mo><msup><mi>e</mi><mrow><mi>m</mi><mo>&minus;</mo><mi>m</mi><mo lspace="0" rspace="0">&prime;</mo></mrow></msup><mo>,</mo>
+      <mspace width="1.5em"/>
+      <mi>ℓ</mi><mo>&larr;</mo><mi>&alpha;</mi><mi>ℓ</mi><mo>+</mo><munder><mo>&sum;</mo><mtext>new tile</mtext></munder><msub><mi>p</mi><mi>j</mi></msub><mo>,</mo>
+      <mspace width="1.5em"/>
+      <mi>O</mi><mo>&larr;</mo><mi>&alpha;</mi><mi>O</mi><mo>+</mo><munder><mo>&sum;</mo><mtext>new tile</mtext></munder><msub><mi>p</mi><mi>j</mi></msub><msub><mi>v</mi><mi>j</mi></msub>
+    </math>
+  </div>
+  <p>The example below is one row of nine keys, computed both ways: offline,
+  with the whole row in hand (top), and online, one tile of three keys at a
+  time, the way a flash-attention kernel does it (bottom). Both halves use the
+  same keys, columns and scales. The buttons step the bottom half through the
+  kernel's loop (arrow keys work once the diagram is clicked).</p>
+  <bbe-offline-online data-widget></bbe-offline-online>
+
+  <h3>Offline: subtract a reference so <math><mi>exp</mi></math> does not overflow</h3>
+  <p>The scores are between 91 and 95. In fp32,
+  <math><msup><mi>e</mi><mi>x</mi></msup></math> is <code>inf</code> for any
+  <math><mi>x</mi><mo>&gt;</mo><mn>88.72</mn></math>, so every
+  <math><msup><mi>e</mi><mi>s</mi></msup></math> is <code>inf</code>, both sums
+  are <code>inf</code>, and <math><mi>out</mi></math> is
+  <code>inf / inf = NaN</code>. Multiplying every term of both sums by the same
+  factor <math><msup><mi>e</mi><mrow><mo>&minus;</mo><mi>m</mi></mrow></msup></math>
+  leaves the ratio unchanged, which gives the offline line above. The weights
+  are then at most <math><msup><mi>e</mi><mn>0</mn></msup><mo>=</mo><mn>1</mn></math>.
+  In the example, <math><mi>m</mi><mo>=</mo><mn>95</mn></math> (top half).</p>
+
+  <h3>Online: keys arrive one tile at a time, so <math><mi>m</mi></math> has to move</h3>
+  <p>A flash-attention kernel never holds the whole row. It reads the keys one
+  tile at a time (128 keys in practice, 3 here) and keeps
+  <math><mi>m</mi></math>, <math><mi>ℓ</mi></math> and <math><mi>O</mi></math>
+  as running values. It cannot know that 95 is the largest score until it has
+  seen tile 2, so <math><mi>m</mi></math> is the largest score so far. When a
+  tile brings a larger score, the kernel applies the online line above: it
+  multiplies the old <math><mi>ℓ</mi></math> and <math><mi>O</mi></math> by
+  <math><mi>&alpha;</mi></math>, then adds the new tile.</p>
+  <ol>
+    <li>After tile 1 (scores 91, 93, 92), <math><mi>m</mi><mo>=</mo><mn>93</mn></math>.
+    The weights are
+    <math><msup><mi>e</mi><mrow><mo>&minus;</mo><mn>2</mn></mrow></msup><mo>,</mo><mn>1</mn><mo>,</mo><msup><mi>e</mi><mrow><mo>&minus;</mo><mn>1</mn></mrow></msup></math>,
+    so <math><mi>ℓ</mi><mo>=</mo><msup><mi>e</mi><mrow><mo>&minus;</mo><mn>2</mn></mrow></msup><mo>+</mo><mn>1</mn><mo>+</mo><msup><mi>e</mi><mrow><mo>&minus;</mo><mn>1</mn></mrow></msup></math>.</li>
+    <li>Tile 2 brings a score of 95, so <math><mi>m</mi></math> becomes 95.
+    The tile-1 terms in <math><mi>ℓ</mi></math> and <math><mi>O</mi></math>
+    were computed as
+    <math><msup><mi>e</mi><mrow><mi>s</mi><mo>&minus;</mo><mn>93</mn></mrow></msup></math>,
+    but against the new reference they should be
+    <math><msup><mi>e</mi><mrow><mi>s</mi><mo>&minus;</mo><mn>95</mn></mrow></msup><mo>=</mo><msup><mi>e</mi><mrow><mi>s</mi><mo>&minus;</mo><mn>93</mn></mrow></msup><mo>&middot;</mo><msup><mi>e</mi><mrow><mo>&minus;</mo><mn>2</mn></mrow></msup></math>.
+    The kernel kept only the sums, not the individual weights, so it
+    multiplies all of <math><mi>ℓ</mi></math> and all of
+    <math><mi>O</mi></math> by
+    <math><mi>&alpha;</mi><mo>=</mo><msup><mi>e</mi><mrow><mn>93</mn><mo>&minus;</mo><mn>95</mn></mrow></msup><mo>=</mo><msup><mi>e</mi><mrow><mo>&minus;</mo><mn>2</mn></mrow></msup></math>
+    and then adds tile 2. The dashed outlines are the sizes before that
+    multiply.</li>
+    <li>Tile 3's largest score is 94, below 95, so <math><mi>m</mi></math>
+    stays and <math><mi>&alpha;</mi><mo>=</mo><mn>1</mn></math>: nothing to
+    rescale.</li>
+    <li>After the last tile, the online <math><mi>m</mi></math> is the offline
+    95, every online weight equals the offline weight above it, and
+    the online <math><mi>ℓ</mi></math> and <math><mi>O</mi></math> end where
+    the offline ones do (the guide lines turn green). The online loop is the offline sum done
+    in pieces; the multiply by <math><mi>&alpha;</mi></math> is what makes the
+    pieces agree. Without it, the tile-1 terms would stay at their dashed
+    sizes.</li>
+    <li>Even if <math><mi>m</mi></math> had stopped short of 95, both sums
+    would carry the same extra factor, which cancels in
+    <math><mi>O</mi><mo>/</mo><mi>ℓ</mi></math>. The reference only has to
+    keep <math><mi>exp</mi></math> in range; it does not have to be exactly
+    the maximum. The next slide uses that freedom.</li>
+  </ol>
+</section>
+
+<section class="slide" data-slug="rescale-policy">
+  <h2><span class="n">2</span>Rescale policy</h2>
+  <div class="where">
+  <pre class="loop" data-hl="m alpha"></pre>
+  <div>
+  <p><b class="k fa4">FA4-style (lazy):</b> move <math><mi>m</mi></math> only when the tile max exceeds it by &gt; 8 log2 units, else <math><mi>&alpha;</mi><mo>=</mo><mn>1</mn></math>.</p>
+  <p><b class="k flex">flex (every tile):</b> move <math><mi>m</mi></math> to the running max on every tile.</p>
+  </div>
+  </div>
+  <bbe-rescalepolicy data-widget></bbe-rescalepolicy>
+</section>
+
+<section class="slide" data-slug="rescale-bits">
+  <h2><span class="n">2</span>Why lazy and every-tile differ in bits</h2>
+  <pre class="loop" data-hl="alpha P l O"></pre>
+  <bbe-unitgrid data-widget></bbe-unitgrid>
+  <p>The same sum in different units, not a reordering. In exact arithmetic
+  every intermediate of the every-tile kernel (each <math><mi>p</mi></math>,
+  <math><mi>ℓ</mi></math> and <math><mi>O</mi></math>) is the lazy one times
+  <math><mi>c</mi><mo>=</mo><msup><mi>e</mi><mrow><msub><mi>m</mi><mtext>lazy</mtext></msub><mo>&minus;</mo><msub><mi>m</mi><mtext>new</mtext></msub></mrow></msup></math>,
+  so <math><mi>O</mi><mo>/</mo><mi>ℓ</mi></math> agrees. Rounding does not
+  commute with scaling, <math><mi>fl</mi><mo>(</mo><mi>c</mi><mi>x</mi><mo>)</mo><mo>&ne;</mo><mi>c</mi><mo>&middot;</mo><mi>fl</mi><mo>(</mo><mi>x</mi><mo>)</mo></math>,
+  unless <math><mi>c</mi></math> is a power of two. Each weight, each addition
+  into <math><mi>ℓ</mi></math> and <math><mi>O</mi></math>, the bf16 cast of
+  <math><mover accent="true"><mi>P</mi><mo>~</mo></mover></math>, and every tile's extra
+  <math><mi>fl</mi><mo>(</mo><mi>&alpha;</mi><mi>ℓ</mi><mo>)</mo></math>,
+  <math><mi>fl</mi><mo>(</mo><mi>&alpha;</mi><mi>O</mi><mo>)</mo></math> round
+  on grids that do not correspond.</p>
+  <p>If <math><mi>m</mi></math> moved only in whole log2 units,
+  <math><mi>&alpha;</mi></math> would be a power of two and every rescale
+  exact. On a B200, <math><mi>out</mi></math> then differs in 0.1&ndash;0.2% of
+  rows instead of 87&ndash;100%; the rest comes from rounding
+  <math><mi>s</mi><mo>&minus;</mo><mi>m</mi></math> and from
+  <code>ex2.approx</code>, which is shift-invariant only while its argument
+  keeps its sign.</p>
+</section>
+
+<section class="slide" data-slug="scale-placement">
+  <h2><span class="n">3</span>Scale placement</h2>
+  <div class="where">
+    <pre class="loop" data-hl="mask x"></pre>
+    <div>
+      <p><b>The step.</b> With the softmax scale, the weight from slide 2 is
+      <math><msup><mi>e</mi><mrow><mo>(</mo><mi>s</mi><mo>&minus;</mo><mi>m</mi><mo>)</mo><mo>/</mo><msqrt><mi>d</mi></msqrt></mrow></msup></math>.
+      The GPU has <code>ex2</code> but no <code>exp</code>, so
+      <math><mi>x</mi></math> carries two constants,
+      <math><mn>1</mn><mo>/</mo><msqrt><mi>d</mi></msqrt></math> and
+      <math><msub><mi>log</mi><mn>2</mn></msub><mi>e</mi></math>.</p>
+      <p><b>Partial blocks.</b> A partial block holds some hidden (query, key)
+      pairs, whose scores must be &minus;&infin; before the max and the
+      <code>ex2</code>. On a full block the mask does nothing, so flex compiles
+      the loop body twice, with and without it.</p>
+    </div>
+  </div>
+  <table class="t vs">
+    <tr><th class="k fa4">FA4-style</th><td><code>m</code> in raw units, <code>log2 e / &radic;d</code> folded into one constant ahead of time: one <code>fma</code> in the source, on every block (the mask acts earlier, on raw <code>S</code>)</td></tr>
+    <tr><th class="k flex">flex, partial</th><td>source: <code>&times; 1/&radic;d</code>, mask, <code>&times; log2 e</code>, <code>&minus; m</code>; LLVM moves the mask after <code>&times; log2 e</code>, leaving mul, mul, sub</td></tr>
+    <tr><th class="k flex">flex, full</th><td>no mask, so <code>&times; log2 e</code> feeds <code>&minus; m</code> and the compiler fuses them into one <code>fma</code></td></tr>
+  </table>
+  <bbe-scaleplace data-widget></bbe-scaleplace>
+</section>
+
+<section class="slide" data-slug="row-sum">
+  <h2><span class="n">4</span>Row-sum order</h2>
+  <div class="where">
+    <pre class="loop" data-hl="l"></pre>
+    <div>
+      <p><b>The step.</b> Each tile adds its 128 fp32 weights for one query
+      row into <math><mi>ℓ</mi></math>, the denominator of
+      <math><mi>O</mi><mo>/</mo><mi>ℓ</mi></math>. The order of those adds,
+      and where the old <math><mi>&alpha;</mi><mi>ℓ</mi></math> joins, is set
+      by how the tile's rows are spread over threads.</p>
+      <p><b class="k fa4">FA4-style:</b> <math><mi>&alpha;</mi><mi>ℓ</mi></math> starts accumulator 0.
+      <b class="k flex">flex:</b> one <code>fma</code> adds <math><mi>&alpha;</mi><mi>ℓ</mi></math> at the end.</p>
+    </div>
+  </div>
+  <bbe-rowsum data-widget></bbe-rowsum>
+</section>
+
+<section class="slide" data-slug="div-log2">
+  <h2><span class="n">5</span>Why several versions of x / y and log2</h2>
+  <div class="where">
+    <pre class="loop" data-hl="out lse"></pre>
+    <ul class="setup">
+      <li>No divide unit: every fp32 <code>x / y</code> starts from <code>MUFU.RCP</code></li>
+      <li>MUFU (rcp, lg2, ex2): 16 results/clk/SM; FFMA: 128 (sm_90)</li>
+    </ul>
+  </div>
+  <table class="t fn">
+    <tr><th></th><th>PTX</th><th>SASS (sm_100)</th><th>max error</th><th>default in</th></tr>
+    <tr class="grp"><th colspan="5">x / y</th></tr>
+    <tr><th>correctly rounded</th><td><code>div.rn.f32</code></td><td>MUFU.RCP, FCHK, 5 FFMA; slow path: ~85 instr.</td><td>0 ulp</td><td>CUDA <code>/</code>, <code>tl.math.div_rn</code></td></tr>
+    <tr class="flex"><th>full range</th><td><code>div.full.f32</code></td><td>MUFU.RCP, FMUL + range fixup</td><td>2 ulp</td><td>Triton <code>/</code> &rarr; <span class="k flex">flex</span></td></tr>
+    <tr class="fa4"><th>reciprocal</th><td><code>rcp.approx.f32</code>, <code>mul</code></td><td>MUFU.RCP, FMUL + range fixup</td><td>1 ulp + 1 rounding</td><td><span class="k fa4">FA4-style</span>: 1 rcp per row</td></tr>
+    <tr><th>fast</th><td><code>div.approx.f32</code></td><td>MUFU.RCP, FMUL</td><td>2 ulp, |y| &le; 2<sup>126</sup></td><td>CUDA <code>--use_fast_math</code></td></tr>
+    <tr class="grp"><th colspan="5">log2 x</th></tr>
+    <tr class="flex"><th>library</th><td>libdevice <code>log2f</code></td><td>~25 instr., 12 FFMA, no MUFU</td><td>1 ulp</td><td>CUDA <code>log2f</code>, <code>tl.math.log2</code> &rarr; <span class="k flex">flex</span></td></tr>
+    <tr class="fa4"><th>hardware</th><td><code>lg2.approx.f32</code></td><td>MUFU.LG2</td><td>2<sup>&minus;22</sup> abs. on (0.5, 2)</td><td>CUDA <code>--use_fast_math</code>, <span class="k fa4">FA4-style</span></td></tr>
+  </table>
+</section>
+
+<section class="slide" data-slug="function-choice">
+  <h2><span class="n">5</span>Function choice</h2>
+  <pre class="loop" data-hl="out lse"></pre>
+  <bbe-div-heatmap data-widget></bbe-div-heatmap>
+</section>
+
+<section class="slide" data-slug="variants">
+  <h2>One loop, five decisions</h2>
+  <bbe-variants data-widget></bbe-variants>
+</section>
+
+</main>
+<div class="nav"><button data-d="-1">&larr;</button> <span class="pos"></span> <button data-d="1">&rarr;</button> <button class="theme">light / dark</button></div>
+<script type="module">
+  import { LOOP } from '../src/variants.js';
+  const width = (h) => h.replace(/<[^>]+>|\p{M}/gu, '').length;
+  document.querySelectorAll('pre.loop').forEach((pre) => {
+    const hl = pre.dataset.hl.split(' ');
+    pre.innerHTML = '<code>' + LOOP.map(([k, code, cm]) => {
+      code = code.replace(/ℓ/g, '<span class="ch">ℓ</span>');
+      const line = cm ? code + ' '.repeat(38 - width(code)) + `<span class="cm"># ${cm}</span>` : code;
+      return hl.includes(k) ? `<span class="hl">${line}</span>` : line + '\n';
+    }).join('').trimEnd() + '</code>';
+  });
+
+  const slides = [...document.querySelectorAll('.slide')], pos = document.querySelector('.pos');
+  let i = 0;
+  function show(k) {
+    i = Math.max(0, Math.min(slides.length - 1, k));
+    slides.forEach((s, j) => s.classList.toggle('on', j === i));
+    pos.textContent = `${i + 1} / ${slides.length}`;
+    history.replaceState(null, '', `#${slides[i].dataset.slug}`);
+  }
+  addEventListener('keydown', (e) => {
+    if (['ArrowRight', 'PageDown', ' '].includes(e.key)) { e.preventDefault(); show(i + 1); }
+    if (['ArrowLeft', 'PageUp'].includes(e.key)) { e.preventDefault(); show(i - 1); }
+  });
+  document.querySelectorAll('.nav [data-d]').forEach((b) => b.onclick = () => show(i + +b.dataset.d));
+  document.querySelector('.theme').onclick = () =>
+    localStorage.setItem('bbe-theme', document.documentElement.classList.toggle('dark') ? 'dark' : 'light');
+  show(Math.max(0, slides.findIndex((s) => s.dataset.slug === location.hash.slice(1))));
+</script>
+<script type="module" src="../src/visitorder.js"></script>
+<script type="module" src="../src/offline-online.js"></script>
+<script type="module" src="../src/rescalepolicy.js"></script>
+<script type="module" src="../src/unitgrid.js"></script>
+<script type="module" src="../src/scaleplace.js"></script>
+<script type="module" src="../src/rowsum.js"></script>
+<script type="module" src="../src/div-heatmap.js"></script>
+<script type="module" src="../src/variants.js"></script>
+<script type="module" src="../src/sdpa.js"></script>
+</body>
+</html>

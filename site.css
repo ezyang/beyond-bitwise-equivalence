@@ -1,0 +1,60 @@
+/* Palette: widgets use ONLY these variables (never hardcoded hex), so night
+   mode is one block. Light values follow the scaling-dsv3 warm-grey look. */
+:root {
+  color-scheme: light;
+  --bg: #f9f9f7; --card: #ffffff; --panel: #f3f2ee; --rule: #e1e0d9; --rule-strong: #c3c2b7;
+  --ink: #0b0b0b; --text: #1c1c1a; --muted: #52514e; --faint: #898781;
+  --blue: #2a78d6; --blue-soft: #dcebfa;      /* "kept" / exact / reference */
+  --orange: #eb6834; --orange-soft: #fbd4c0;  /* rounded away / dropped / differs */
+  --green: #1baf7a; --green-soft: #e0f3f3;    /* agrees */
+  --red: #d03b3b; --red-soft: #fdf1f1;        /* error / mismatch emphasis */
+  --amber: #eda100; --amber-soft: #fff3d1;    /* highlight / current step */
+  --purple: #7b2fa8; --purple-soft: #f3f1fb;  /* compiler decisions */
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+:root.dark {
+  color-scheme: dark;
+  --bg: #161614; --card: #232320; --panel: #2a2923; --rule: #3d3b34; --rule-strong: #615e51;
+  --ink: #e8e5dc; --text: #d6d3ca; --muted: #b0ada4; --faint: #97948b;
+  --blue: #5c9ae6; --blue-soft: #223950;
+  --orange: #f0824f; --orange-soft: #4a2c1e;
+  --green: #2bbd88; --green-soft: #18302f;
+  --red: #e25555; --red-soft: #322323;
+  --amber: #eaa620; --amber-soft: #322a10;
+  --purple: #b675e8; --purple-soft: #272438;
+}
+
+body { font: 16px/1.6 var(--sans); color: var(--ink); background: var(--bg); margin: 0; }
+main { max-width: 980px; margin: 0 auto; padding: 32px 20px 120px; }
+h1 { font-size: 28px; line-height: 1.25; margin: 8px 0 4px; }
+h2 { font-size: 20px; margin: 48px 0 8px; }
+h3 { font-size: 16.5px; margin: 30px 0 6px; }
+p, li { max-width: 720px; color: var(--text); }
+ul, ol { max-width: 720px; box-sizing: border-box; }
+a { color: var(--blue); }
+.dek { font-size: 19px; line-height: 1.45; color: var(--muted); margin: 4px 0 20px; max-width: 620px; }
+.note, .sub { color: var(--muted); font-size: 13.5px; }
+code { font: 13px var(--mono); background: var(--panel); border-radius: 4px; padding: 1px 5px; }
+pre { font: 13px/1.5 var(--mono); background: var(--panel); border-radius: 6px; padding: 10px 14px;
+  max-width: 720px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+table.t { border-collapse: collapse; font-size: 13.5px; margin: 12px 0; max-width: 940px; }
+.t th, .t td { text-align: left; padding: 5px 14px 5px 0; border-bottom: 1px solid var(--rule);
+  vertical-align: top; font-variant-numeric: tabular-nums; }
+.t th { color: var(--muted); font-weight: 600; }
+figure { margin: 18px 0 26px; }
+figcaption { font-size: 13.5px; color: var(--muted); max-width: 720px; margin-top: 6px; }
+.draft { border-left: 3px solid var(--amber); background: var(--amber-soft); padding: 8px 12px;
+  font-size: 14px; max-width: 696px; border-radius: 0 4px 4px 0; }
+.toc { font-size: 14.5px; }
+.toc li { margin: 2px 0; }
+
+/* Custom elements are inline until their module defines them; make every
+   widget a block so a missing or still-loading module doesn't collapse. */
+[data-widget] { display: block; min-height: 120px; }
+[data-widget]:not(:defined) { border: 1px dashed var(--rule-strong); border-radius: 6px; }
+
+/* Author flags: a passage with an open question. Search the source for [[FLAG: */
+mark.flag { background: none; color: inherit; text-decoration: underline wavy var(--red); text-underline-offset: 3px; }
+.flag-why { color: var(--red); font-size: 13px; }

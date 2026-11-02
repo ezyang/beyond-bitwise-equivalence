@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gallery C: fast math widgets</title>
+<link rel="stylesheet" href="../site.css">
+<style>
+  .theme { position: fixed; top: 10px; right: 12px; font: 12px var(--sans); padding: 3px 10px; border: 1px solid var(--rule-strong);
+    border-radius: 4px; background: var(--card); color: var(--muted); cursor: pointer; }
+  h2 code { font-size: 15px; }
+</style>
+<script>if (location.hash === '#dark') document.documentElement.classList.add('dark');</script>
+</head>
+<body>
+<button class="theme" onclick="document.documentElement.classList.toggle('dark')">light / dark</button>
+<main>
+<h1>Gallery C: fast math widgets</h1>
+<p class="dek">Development page for the section 4 ("Fast math") illustrations.</p>
+
+<h2><code>bbe-transc-ex2</code>: how a GPU computes 2^x</h2>
+<bbe-transc-ex2 data-widget></bbe-transc-ex2>
+
+<h2><code>bbe-transc-err</code>: two valid approximations, different bits</h2>
+<bbe-transc-err data-widget></bbe-transc-err>
+
+<h2><code>bbe-transc-div</code>: three instructions for x / y</h2>
+<bbe-transc-div data-widget></bbe-transc-div>
+</main>
+<script type="module" src="../src/transc-ex2.js"></script>
+<script type="module" src="../src/transc-err.js"></script>
+<script type="module" src="../src/transc-div.js"></script>
+</body>
+</html>

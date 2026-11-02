@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gallery B: structure widgets</title>
+<link rel="stylesheet" href="../site.css">
+<style>
+  .theme { position: fixed; top: 10px; right: 12px; font: 12px var(--sans); padding: 3px 10px; border: 1px solid var(--rule-strong);
+    border-radius: 4px; background: var(--card); color: var(--muted); cursor: pointer; }
+  h2 code { font-size: 15px; }
+</style>
+<script>if (location.hash === '#dark') document.documentElement.classList.add('dark');</script>
+</head>
+<body>
+<button class="theme" onclick="document.documentElement.classList.toggle('dark')">light / dark</button>
+<main>
+<h1>Gallery B: structure widgets</h1>
+<p class="dek">Development page for the group-B illustrations.</p>
+
+<h2><code>bbe-gpuorg</code>: GPU organisation primer</h2>
+<bbe-gpuorg data-widget></bbe-gpuorg>
+
+<h2><code>bbe-coalesce</code>: Why threads own strided elements</h2>
+<bbe-coalesce data-widget></bbe-coalesce>
+
+<h2><code>bbe-hwmap</code>: Reduction order (element → thread)</h2>
+<bbe-hwmap data-widget></bbe-hwmap>
+
+<h2><code>bbe-hwtree</code>: Reduction order (thread → warp → block → grid)</h2>
+<bbe-hwtree data-widget></bbe-hwtree>
+
+<h2><code>bbe-tileorder</code>: Tile order</h2>
+<bbe-tileorder data-widget></bbe-tileorder>
+
+<h2><code>bbe-sdpa</code>: Attention blocks and the loop</h2>
+<bbe-sdpa data-widget></bbe-sdpa>
+
+<h2><code>bbe-variants</code>: Two kernels, one loop</h2>
+<bbe-variants data-widget></bbe-variants>
+
+<h2><code>bbe-contraction</code>: The compiler is part of the semantics</h2>
+<bbe-contraction data-widget></bbe-contraction>
+
+<h2><code>bbe-backward</code>: The backward</h2>
+<bbe-backward data-widget></bbe-backward>
+</main>
+<script type="module" src="../src/gpuorg.js"></script>
+<script type="module" src="../src/coalesce.js"></script>
+<script type="module" src="../src/hwmap.js"></script>
+<script type="module" src="../src/hwtree.js"></script>
+<script type="module" src="../src/tileorder.js"></script>
+<script type="module" src="../src/sdpa.js"></script>
+<script type="module" src="../src/variants.js"></script>
+<script type="module" src="../src/contraction.js"></script>
+<script type="module" src="../src/backward.js"></script>
+</body>
+</html>
