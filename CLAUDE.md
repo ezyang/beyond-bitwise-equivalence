@@ -59,4 +59,6 @@ generality. Sibling project with the same taste: `../scaling-dsv3`.
 
 ## Git
 
-- Commit only when asked.
+- Commit after each logical change without being asked: one coherent
+  change per commit, with a short message saying what changed and why.
+  Run the relevant checks first. Don't push.
