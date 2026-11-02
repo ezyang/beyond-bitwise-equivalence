@@ -114,11 +114,11 @@ for (const [x, y] of DIV_PRESETS) {
 }
 ok(!divSets(3, 7).viaRcp.includes(f32(3 / 7)), '3/7: x*rcp(y) can never be the correctly rounded quotient');
 
-// <bbe-div-heatmap>: the widget draws data/div-measured.json, measured on a
+// <bbe-lse-heatmap>: the widget draws data/div-measured.json, measured on a
 // GPU by scripts/measure-div.py (no exact model of rcp.approx / lg2.approx
-// exists to recompute it).  Check the file's structure and the facts the
-// slide relies on, and that every number the widget prints matches.
-import { shown } from '../src/div-heatmap.js';
+// exists to recompute it).  Check the file's structure and the identities it
+// records, and that every number the widget prints matches.
+import { shown } from '../src/lse-heatmap.js';
 import { readFileSync } from 'node:fs';
 {
   const d = JSON.parse(readFileSync(new URL('../data/div-measured.json', import.meta.url), 'utf8'));
@@ -137,11 +137,11 @@ import { readFileSync } from 'node:fs';
     L.M.forEach((m, j) => eq(m, f32(-16 + 64 * (j + (0.6180339887 * (j + 1)) % 1) / n), `lse grid M[${j}]`));
     L.l.forEach((l, i) => eq(l, f32(2 ** (15 * (i + 0.5) / n)), `lse grid l[${i}]`));
     eq(JSON.stringify(shown(d)), JSON.stringify({
-      out: [['<0.1%', '11.4%', '71.4%', '17.1%', '<0.1%', 2], ['<0.1%', '11.4%', '71.4%', '17.1%', '<0.1%', 2]],
       lse: [['1.1%', '8.6%', '82.5%', '7.8%', '<0.1%', 6], ['0%', '7.1%', '84.5%', '8.4%', '0%', 1]],
-      lseGrey: '4.5%',
-    }), 'numbers shown by bbe-div-heatmap');
-    console.log(`  div-heatmap (${d.device}): ${JSON.stringify(shown(d))}`);
+      closer: ['0%', '0.3%', '97.0%', '0.4%', '1.4%', '1.0%'],
+      grey: '4.5%',
+    }), 'numbers shown by bbe-lse-heatmap');
+    console.log(`  lse-heatmap (${d.device}): ${JSON.stringify(shown(d))}`);
   }
 }
 

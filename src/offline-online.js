@@ -49,11 +49,11 @@ bbe-offline-online .one { stroke: var(--rule); stroke-dasharray: 3 3; }
 bbe-offline-online rect { vector-effect: non-scaling-stroke; transition: transform 300ms ease, opacity 300ms ease, fill 300ms, stroke 300ms; }
 bbe-offline-online .sc { fill: var(--panel); stroke: var(--rule-strong); }
 bbe-offline-online .sc.off { fill: none; stroke-dasharray: 2 2; }
-bbe-offline-online .old { fill: var(--blue-soft); stroke: var(--blue); }
-bbe-offline-online .cur { fill: var(--amber-soft); stroke: var(--amber); }
+bbe-offline-online .old { fill: color-mix(in srgb, var(--muted) 35%, var(--card)); stroke: var(--muted); }
+bbe-offline-online .cur { fill: color-mix(in srgb, var(--ink) 65%, var(--card)); stroke: var(--ink); }
 bbe-offline-online .was { fill: none; stroke: var(--orange); stroke-dasharray: 3 2; }
-bbe-offline-online .ref { stroke: var(--amber); stroke-width: 2.5; fill: none; }
-bbe-offline-online .refl { fill: var(--amber); font-weight: 600; }
+bbe-offline-online .ref { stroke: var(--ink); stroke-width: 2.5; fill: none; }
+bbe-offline-online .refl { fill: var(--ink); font-weight: 600; }
 bbe-offline-online .mv-g { transition: transform 300ms ease; }
 bbe-offline-online .eq { stroke: var(--rule-strong); stroke-width: 1; stroke-dasharray: 2 3; transition: stroke 300ms; }
 bbe-offline-online .eq.on { stroke: var(--green); stroke-width: 2; stroke-dasharray: none; }

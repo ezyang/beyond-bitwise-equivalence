@@ -41,12 +41,12 @@ bbe-rescalepolicy .ax { stroke: var(--rule-strong); }
 bbe-rescalepolicy .rule { stroke: var(--rule); }
 bbe-rescalepolicy .one { stroke: var(--rule); stroke-dasharray: 3 3; }
 bbe-rescalepolicy .sc { fill: var(--panel); stroke: var(--rule-strong); }
-bbe-rescalepolicy .band { fill: var(--amber-soft); }
-bbe-rescalepolicy .old { fill: var(--blue-soft); stroke: var(--blue); }
-bbe-rescalepolicy .cur { fill: var(--amber-soft); stroke: var(--amber); }
+bbe-rescalepolicy .band { fill: color-mix(in srgb, var(--ink) 8%, transparent); }
+bbe-rescalepolicy .old { fill: color-mix(in srgb, var(--muted) 35%, var(--card)); stroke: var(--muted); }
+bbe-rescalepolicy .cur { fill: color-mix(in srgb, var(--ink) 65%, var(--card)); stroke: var(--ink); }
 bbe-rescalepolicy .was { fill: none; stroke: var(--orange); stroke-dasharray: 3 2; }
-bbe-rescalepolicy .ref { stroke: var(--amber); stroke-width: 2.5; fill: none; }
-bbe-rescalepolicy .refl { fill: var(--amber); font-weight: 600; }
+bbe-rescalepolicy .ref { stroke: var(--ink); stroke-width: 2.5; fill: none; }
+bbe-rescalepolicy .refl { fill: var(--ink); font-weight: 600; }
 `;
 const sup = (b, e) => `${b}<tspan dy="-5" font-size="9">${e}</tspan><tspan dy="5"></tspan>`;
 // the two strings with the part after their common prefix in orange

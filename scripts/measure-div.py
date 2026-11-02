@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure fp32 division, log2 and the final lse on an NVIDIA GPU for <bbe-div-heatmap>.
+"""Measure fp32 division, log2 and the final lse on an NVIDIA GPU for <bbe-lse-heatmap>.
 
 Run on any machine with a CUDA GPU and torch + triton installed (the triton
 that ships with torch is enough). From the repo root:
@@ -41,7 +41,7 @@ lse, as each kernel computes it (bf16 inputs, so FA4's max_offset is 0):
        then torch/nn/attention/flex_attention.py (_finalize_outputs,
        stats_are_log2) returns lse * math.log(2), an fp32 multiply.
 
-The grid definitions must match src/div-heatmap.js. Signed ulps are the
+The lse grid definition must match src/lse-heatmap.js. Signed ulps are the
 difference of the two values' positions on the ordered fp32 line, so +1 means
 the next fp32 value up.
 
